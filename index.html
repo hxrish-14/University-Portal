@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="University Portal — student and staff academic records.">
+<meta name="color-scheme" content="light dark">
+<title>University Portal</title>
+
+<link rel="stylesheet" href="style.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<!-- Applied before first paint so there is never a flash of the wrong theme. -->
+<script>
+  (function () {
+    var saved = localStorage.getItem("up_theme");
+    var theme = saved || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    if (theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
+  })();
+</script>
+
+<script src="https://unpkg.com/@supabase/supabase-js"></script>
+</head>
+<body>
+
+<a class="skip-link" href="#mainContent">Skip to content</a>
+
+<!-- Shown until we know whether a valid session exists, so the app
+     never flashes Dashboard→Login or Student→Staff. -->
+<div id="authGate" class="auth-gate"><div class="spinner"></div></div>
+
+<!-- Public. No authenticated nav, no Logout, no Dashboard/Result/Fees/
+     Help/Online/Profile links — and no college name, per spec. -->
+<div id="loginScreen" class="hidden"></div>
+
+<!-- Authenticated shell, built entirely by app.js once a role is known. -->
+<div id="appShell" class="hidden">
+  <header class="app-header" id="appHeader">
+    <div class="brand"><span class="brand-mark">UP</span><span>University Portal</span></div>
+    <nav class="app-nav" id="appNav" aria-label="Primary">
+      <span class="nav-indicator" id="navIndicator" aria-hidden="true"></span>
+    </nav>
+    <div class="header-actions">
+      <button class="theme-toggle" id="themeToggle" type="button"></button>
+      <button class="btn btn-outline" id="logoutBtn" type="button">Logout</button>
+    </div>
+  </header>
+
+  <main id="mainContent"></main>
+
+  <footer class="app-footer">
+    <span class="foot-left"></span>
+    <span class="foot-center">University Portal © 2026</span>
+    <span class="foot-right"></span>
+  </footer>
+</div>
+
+<div class="modal-overlay" id="modalOverlay" role="dialog" aria-modal="true">
+  <div class="modal-box"><div id="modalBody"></div></div>
+</div>
+
+<div class="toast-stack" id="toastStack" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

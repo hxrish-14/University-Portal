@@ -20,8 +20,6 @@ const CONFIG = Object.freeze({
   courseSemesterCounts: { BCA: 6, ENGINEERING: 8 },
   defaultCourseCode: "BCA",
 
-  studentEmailDomain: "student.gasc-demo.edu",
-
   avatarBucket: "avatars",
   maxAvatarSizeBytes: 2 * 1024 * 1024,
   allowedAvatarTypes: ["image/jpeg", "image/png", "image/webp"],
@@ -61,15 +59,16 @@ function getSupabase() {
   return supabaseClient;
 }
 
-function regnoToEmail(regno) {
-  return `${String(regno).trim()}@${CONFIG.studentEmailDomain}`;
-}
-
-function dobToPassword(dobValue) {
-  // "2004-05-15" -> "20040515" — matches scripts/provision-auth-users.mjs exactly.
-  return String(dobValue).replace(/-/g, "");
-}
-
+// Student login is a DIRECT TABLE LOOKUP against `profiles` — no
+// Supabase Auth user is created or required for students. The register
+// number + DOB the student types are matched straight against the
+// seeded row. This is intentionally simpler than the staff path below,
+// per the current requirement to drop Supabase Auth for students
+// entirely. See the "Required Supabase changes" note shipped alongside
+// this file for the RLS this depends on (anon SELECT access needed on
+// `profiles`/`results`/`fee_records`/`arrear_exam_applications`/
+// `subjects`/`courses`/`portal_settings` since there is no auth session
+// to scope by) — and the real security trade-off that comes with it.
 async function handleStudentLogin(e) {
   e.preventDefault();
   const regno = document.getElementById("studentRegno").value.trim();
@@ -88,13 +87,19 @@ async function handleStudentLogin(e) {
     const sb = getSupabase();
     if (!sb) throw new AppError("The portal isn't configured correctly. Please try again later.");
 
-    const { data, error } = await sb.auth.signInWithPassword({
-      email: regnoToEmail(regno),
-      password: dobToPassword(dob)
-    });
+    const { data, error } = await sb
+      .from(CONFIG.tables.profiles)
+      .select("*")
+      .eq("register_number", regno)
+      .eq("dob", dob)
+      .eq("role", CONFIG.roles.student)
+      .maybeSingle();
 
-    if (error) throw new AppError("Invalid register number or password.", error);
-    await resolveSessionAndRoute(data.user);
+    if (error) throw new AppError("Unable to connect to the server. Please check your internet connection.", error);
+    if (!data) throw new AppError("Invalid register number or password.");
+
+    startStudentSession(data);
+    await renderStudentShell();
   } catch (err) {
     setLoginMessage(messageEl, err.userMessage || "Invalid register number or password.", "error");
     if (!(err instanceof AppError)) console.error(err);
@@ -142,6 +147,11 @@ function setLoginMessage(el, text, type) {
   el.className = type || "";
 }
 
+// Handles logout for BOTH session types. sb.auth.signOut() is a no-op
+// (and never throws to the caller, since it's wrapped) when the current
+// session is a student's — students never had a Supabase Auth session
+// to sign out of. sessionStorage.clear() removes the student session
+// key AND Supabase's own persisted staff session in one step.
 async function handleLogout(message) {
   SessionManager.stop();
   const sb = getSupabase();
@@ -151,9 +161,11 @@ async function handleLogout(message) {
   renderLoginScreen(message || null);
 }
 
-// Fetches the caller's own profile (RLS-restricted to their own row or
-// staff) and uses its `role` column as the only source of truth for
-// what the UI shows — the frontend never decides this on its own.
+// STAFF ONLY: fetches the caller's own profile (RLS-restricted to their
+// own row) using the real Supabase Auth user id, and uses its `role`
+// column as the only source of truth for what the UI shows — the
+// frontend never decides this on its own. Students never reach this
+// function; see handleStudentLogin() + startStudentSession() instead.
 async function resolveSessionAndRoute(user) {
   const sb = getSupabase();
   APP.user = user;
@@ -210,6 +222,31 @@ const SessionManager = (() => {
 
   return { start, stop };
 })();
+
+// A student "session" is just the fetched profile row, cached in
+// sessionStorage (not localStorage, so closing the tab/browser clears
+// it — same guarantee Supabase Auth gives the staff path). This is the
+// entire session mechanism for students: no token, no Supabase Auth
+// user, just this row plus the inactivity timer above.
+const STUDENT_SESSION_KEY = "up_student_session";
+
+function startStudentSession(profile) {
+  APP.user = null;
+  APP.profile = profile;
+  APP.role = CONFIG.roles.student;
+  sessionStorage.setItem(STUDENT_SESSION_KEY, JSON.stringify(profile));
+  SessionManager.start(() => handleLogout("Your session expired due to inactivity. Please log in again."));
+}
+
+function getStoredStudentSession() {
+  const raw = sessionStorage.getItem(STUDENT_SESSION_KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
 
 /* =============================== ROUTING =============================== */
 
@@ -337,17 +374,36 @@ async function bootstrapAuth() {
   const sb = getSupabase();
   if (!sb) { renderLoginScreen("The portal isn't configured correctly. Please try again later."); return; }
 
+  // Only ever tears down a STAFF session. Students never have a
+  // Supabase Auth session, so this event never legitimately fires for
+  // them — the role guard is still here defensively so a stray event
+  // can never wipe a student session that was just restored below.
   sb.auth.onAuthStateChange((event) => {
-    if (event === "SIGNED_OUT") {
+    if (event === "SIGNED_OUT" && APP.role === CONFIG.roles.staff) {
       APP.user = null; APP.profile = null; APP.role = null;
       SessionManager.stop();
       renderLoginScreen();
     }
   });
 
+  // 1. Staff: a real Supabase Auth session, if one exists.
   const { data: { session } } = await sb.auth.getSession();
-  if (session?.user) await resolveSessionAndRoute(session.user);
-  else renderLoginScreen();
+  if (session?.user) {
+    await resolveSessionAndRoute(session.user);
+    return;
+  }
+
+  // 2. Student: a session-scoped table lookup result restored from a
+  //    prior handleStudentLogin() call in this same browser tab session.
+  const storedStudent = getStoredStudentSession();
+  if (storedStudent) {
+    startStudentSession(storedStudent);
+    await renderStudentShell();
+    return;
+  }
+
+  // 3. Neither — show the login screen.
+  renderLoginScreen();
 }
 
 /* =============================== STUDENT =============================== */

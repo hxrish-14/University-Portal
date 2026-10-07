@@ -1,5 +1,4 @@
 /* =========================================================
-   UNIVERSITY PORTAL — style.css
 
    Direction: "Academic Ledger" — editorial serif headings, a
    quiet grotesque body face, warm paper in light mode / deep
@@ -14,7 +13,6 @@
    DASHBOARD/PROFILE · RESULTS · MODAL · TOAST · LOADING
    ANIMATIONS · ACCESSIBILITY · RESPONSIVE · PRINT
    ========================================================= */
-
 /* ---------------- RESET ---------------- */
 *, *::before, *::after { box-sizing: border-box; }
 body, h1, h2, h3, h4, p, figure { margin: 0; }

@@ -562,21 +562,41 @@ function renderHelpPage(main) {
 
 const StaffState = { page: 0, pageSize: 10, search: "", totalCount: 0, rows: [], selectedIds: new Set() };
 
+// Staff/Admin keeps every student-facing capability (their own
+// Dashboard/Result/Fees/Profile — reusing the exact same render
+// functions STUDENT uses, not a fork of them) PLUS the admin-only
+// Students and Result Export tools. Nothing below duplicates logic
+// that already exists in the STUDENT section.
 async function renderStaffShell() {
   mountAppShell({
     navItems: [
+      { key: "dashboard", label: "Dashboard" },
+      { key: "results", label: "Result" },
+      { key: "fees", label: "Fees" },
+      { key: "profile", label: "Profile" },
       { key: "students", label: "Students" },
       { key: "resultExport", label: "Result Export" },
       { key: "help", label: "Help" }
     ],
     onNav: (key) => showStaffView(key)
   });
+
+  // Needed so the shared renderStudentResults() view knows how many
+  // semester tabs to draw if the admin opens their own "Result" tab.
+  await loadCourseSemesterCount();
   showStaffView("students");
 }
 
 function showStaffView(key) {
   setActiveNav(key);
   const main = document.getElementById("mainContent");
+  // Shared with STUDENT — same functions, same data shape, since a
+  // staff/admin account is still just a `profiles` row underneath.
+  if (key === "dashboard") return renderStudentDashboard(main);
+  if (key === "results") return renderStudentResults(main);
+  if (key === "fees") return renderStudentFees(main);
+  if (key === "profile") return renderStudentProfile(main);
+  // Admin-only.
   if (key === "students") return renderStaffStudents(main);
   if (key === "resultExport") return renderStaffResultExport(main);
   if (key === "help") return renderHelpPage(main);
@@ -956,17 +976,26 @@ async function fetchStudentResults(studentId, semester) {
 
 /* ================================ FEES ================================ */
 
+// Redesigned Fees page: a clear top-level summary (billed/paid/pending),
+// then fee records grouped by semester (falling back to an "Other Fees"
+// group for records with no semester — see add-fee-semester.sql) so the
+// page reads as an organized statement instead of one flat table.
+// Reuses the same .section-card / .ledger / .badge / .stat-card
+// components the rest of the portal already uses — no new visual
+// language introduced, per the "preserve existing portal visual
+// language" requirement.
 async function renderStudentFees(main) {
   main.innerHTML = `
     <div class="container">
-      <div class="page-head"><span class="eyebrow">Finance</span><h1>Fees</h1><p>Your fee records and current balance.</p></div>
+      <div class="page-head"><span class="eyebrow">Finance</span><h1>Fees</h1><p>Your fee records and current balance, grouped by semester.</p></div>
       <div id="feesContent" class="loading-block"><div class="spinner"></div></div>
     </div>
   `;
 
   try {
     const sb = getSupabase();
-    const { data, error } = await sb.from(CONFIG.tables.feeRecords).select("*").eq("student_id", APP.profile.id).order("due_date", { ascending: true });
+    const { data, error } = await sb.from(CONFIG.tables.feeRecords).select("*").eq("student_id", APP.profile.id)
+      .order("semester", { ascending: true, nullsFirst: false }).order("due_date", { ascending: true });
     if (error) throw new AppError("We couldn't load your fee records right now.", error);
 
     const container = document.getElementById("feesContent");
@@ -975,23 +1004,70 @@ async function renderStudentFees(main) {
       return;
     }
 
+    const totalBilled = data.reduce((sum, f) => sum + Number(f.amount || 0), 0);
+    const totalPaid = data.reduce((sum, f) => sum + Number(f.paid_amount || 0), 0);
     const totalPending = data.reduce((sum, f) => sum + Number(f.pending_amount || 0), 0);
+
+    // Group by semester; records with no semester (e.g. a one-off exam
+    // fee) land in a trailing "Other Fees" group rather than being
+    // hidden or forced into a guessed semester.
+    const groups = new Map();
+    data.forEach((f) => {
+      const key = f.semester != null ? f.semester : "other";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(f);
+    });
+    const orderedKeys = [...groups.keys()].sort((a, b) => {
+      if (a === "other") return 1;
+      if (b === "other") return -1;
+      return a - b;
+    });
+
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const feeRow = (f) => {
+      const isPaid = f.status === "paid";
+      const isOverdue = !isPaid && f.due_date && f.due_date < todayIso;
+      const label = isPaid ? "PAID" : isOverdue ? "OVERDUE" : "PENDING";
+      return `
+        <div class="ledger-row" style="grid-template-columns: 1.4fr 100px 100px 100px 100px 110px; cursor:default;">
+          <div class="subject-name">${escapeHtml(f.fee_type)}</div>
+          <div class="mono">${formatCurrency(f.amount)}</div>
+          <div class="mono">${formatCurrency(f.paid_amount)}</div>
+          <div class="mono">${formatCurrency(f.pending_amount)}</div>
+          <div><span class="badge ${isPaid ? "badge-pass" : "badge-fail"}">${label}</span></div>
+          <div class="mono">${f.due_date ? formatDate(f.due_date) : "—"}</div>
+        </div>`;
+    };
+
+    const groupsHtml = orderedKeys.map((key) => {
+      const rows = groups.get(key);
+      const title = key === "other" ? "Other Fees" : `Semester ${key}`;
+      const groupPending = rows.reduce((sum, f) => sum + Number(f.pending_amount || 0), 0);
+      return `
+        <div class="section-card">
+          <h2 style="display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+            <span>${title}</span>
+            <span class="mono" style="font-size:13px; font-weight:600; color:${groupPending > 0 ? "var(--danger)" : "var(--accent-secondary)"};">
+              ${groupPending > 0 ? `${formatCurrency(groupPending)} pending` : "Fully paid"}
+            </span>
+          </h2>
+          <div class="ledger">
+            <div class="ledger-head" style="grid-template-columns: 1.4fr 100px 100px 100px 100px 110px;">
+              <div>Fee Type</div><div>Amount</div><div>Paid</div><div>Pending</div><div>Status</div><div>Due Date</div>
+            </div>
+            <div>${rows.map(feeRow).join("")}</div>
+          </div>
+        </div>`;
+    }).join("");
+
     container.innerHTML = `
-      <div class="stat-grid" style="margin-bottom:24px;"><div class="seal-card stat-card"><div class="stat-label">Total Pending</div><div class="stat-value">${formatCurrency(totalPending)}</div></div></div>
-      <div class="ledger">
-        <div class="ledger-head" style="grid-template-columns: 1.4fr 100px 100px 100px 90px 110px;"><div>Fee Type</div><div>Amount</div><div>Paid</div><div>Pending</div><div>Status</div><div>Due Date</div></div>
-        <div>${data.map((f) => `
-          <div class="ledger-row" style="grid-template-columns: 1.4fr 100px 100px 100px 90px 110px; cursor:default;">
-            <div class="subject-name">${escapeHtml(f.fee_type)}</div>
-            <div class="mono">${formatCurrency(f.amount)}</div>
-            <div class="mono">${formatCurrency(f.paid_amount)}</div>
-            <div class="mono">${formatCurrency(f.pending_amount)}</div>
-            <div><span class="badge ${f.status === "paid" ? "badge-pass" : "badge-fail"}">${escapeHtml((f.status || "").toUpperCase())}</span></div>
-            <div class="mono">${formatDate(f.due_date)}</div>
-          </div>`).join("")}
-        </div>
+      <div class="stat-grid" style="margin-bottom:28px;">
+        <div class="stat-card"><div class="stat-label">Total Billed</div><div class="stat-value">${formatCurrency(totalBilled)}</div></div>
+        <div class="stat-card"><div class="stat-label">Total Paid</div><div class="stat-value">${formatCurrency(totalPaid)}</div></div>
+        <div class="seal-card stat-card"><div class="stat-label">Total Pending</div><div class="stat-value">${formatCurrency(totalPending)}</div></div>
       </div>
-      <p style="margin-top:16px; color:var(--text-muted); font-size:13px;">Online payment isn't wired up in this demo — see the accounts office to settle a pending balance.</p>
+      ${groupsHtml}
+      <p style="color:var(--text-muted); font-size:13px;">Online payment isn't wired up in this demo — see the accounts office to settle a pending balance.</p>
     `;
   } catch (err) {
     handleAppError(err);
@@ -1438,6 +1514,17 @@ function closeModal() {
   document.getElementById("modalBody").innerHTML = "";
 }
 
+// Casual deterrent ONLY — disables the right-click context menu so
+// browsing feels less "inspectable" at a glance. This is NOT security:
+// DevTools (F12 / Ctrl+Shift+I), view-source, and the Network tab all
+// remain fully available to anyone who wants them — no client-side
+// JavaScript can prevent that. Real protection for this app lives
+// entirely in RLS + the profile-field-protection trigger server-side,
+// not here.
+function initContextMenuDeterrent() {
+  document.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+
 function initModal() {
   document.getElementById("modalOverlay").addEventListener("click", (e) => { if (e.target.id === "modalOverlay") closeModal(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && document.getElementById("modalOverlay").classList.contains("active")) closeModal(); });
@@ -1489,6 +1576,7 @@ function initGlobalErrorHandlers() {
 document.addEventListener("DOMContentLoaded", async () => {
   initGlobalErrorHandlers();
   initModal();
+  initContextMenuDeterrent();
   await bootstrapAuth();
   initTheme();
 });

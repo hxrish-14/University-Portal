@@ -24,12 +24,18 @@ const CONFIG = Object.freeze({
   maxAvatarSizeBytes: 2 * 1024 * 1024,
   allowedAvatarTypes: ["image/jpeg", "image/png", "image/webp"],
 
+  // Matches scripts/provision-auth-users.mjs exactly — a bare Staff/Admin
+  // login_id (e.g. "Staff") maps to this domain; a full email (e.g.
+  // "Admin@exampleedu.com") is used as-is.
+  loginEmailDomain: "portal.local",
+
   tables: {
     profiles: "profiles", courses: "courses", subjects: "subjects",
     results: "results", arrearApplications: "arrear_exam_applications",
-    feeRecords: "fee_records", portalSettings: "portal_settings"
+    feeRecords: "fee_records", portalSettings: "portal_settings",
+    examTimetable: "exam_timetable", announcements: "announcements"
   },
-  roles: { student: "student", staff: "staff" }
+  roles: { student: "student", staff: "staff", admin: "admin" }
 });
 
 // Runtime app state — never trusted for authorization, only for what to
@@ -93,6 +99,7 @@ async function handleStudentLogin(e) {
       .eq("register_number", regno)
       .eq("dob", dob)
       .eq("role", CONFIG.roles.student)
+      .eq("is_active", true)
       .maybeSingle();
 
     if (error) throw new AppError("Unable to connect to the server. Please check your internet connection.", error);
@@ -108,16 +115,26 @@ async function handleStudentLogin(e) {
   }
 }
 
+// Shared by BOTH Staff and Admin — both are real Supabase Auth accounts,
+// distinguished only by profiles.role after sign-in. A bare identifier
+// (e.g. "Staff") is mapped to an email exactly the way
+// scripts/provision-auth-users.mjs maps it when creating the account;
+// a full email (e.g. "Admin@exampleedu.com") is used as typed.
+function loginIdToEmail(identifier) {
+  const trimmed = String(identifier).trim();
+  return trimmed.includes("@") ? trimmed : `${trimmed.toLowerCase()}@${CONFIG.loginEmailDomain}`;
+}
+
 async function handleStaffLogin(e) {
   e.preventDefault();
-  const email = document.getElementById("staffEmail").value.trim();
+  const identifier = document.getElementById("staffEmail").value.trim();
   const password = document.getElementById("staffPassword").value;
   const messageEl = document.getElementById("loginMessage");
   const btn = document.getElementById("staffLoginBtn");
 
   setLoginMessage(messageEl, "", "");
-  if (!email || !password) {
-    setLoginMessage(messageEl, "Please enter your email and password.", "error");
+  if (!identifier || !password) {
+    setLoginMessage(messageEl, "Please enter your ID/email and password.", "error");
     return;
   }
 
@@ -126,11 +143,11 @@ async function handleStaffLogin(e) {
     const sb = getSupabase();
     if (!sb) throw new AppError("The portal isn't configured correctly. Please try again later.");
 
-    const { data, error } = await sb.auth.signInWithPassword({ email, password });
-    if (error) throw new AppError("Invalid email or password.", error);
+    const { data, error } = await sb.auth.signInWithPassword({ email: loginIdToEmail(identifier), password });
+    if (error) throw new AppError("Invalid ID/email or password.", error);
     await resolveSessionAndRoute(data.user);
   } catch (err) {
-    setLoginMessage(messageEl, err.userMessage || "Invalid email or password.", "error");
+    setLoginMessage(messageEl, err.userMessage || "Invalid ID/email or password.", "error");
     if (!(err instanceof AppError)) console.error(err);
   } finally {
     setButtonBusy(btn, false, "Log in");
@@ -181,12 +198,20 @@ async function resolveSessionAndRoute(user) {
     return;
   }
 
+  if (profile.is_active === false) {
+    await handleLogout("This account has been deactivated. Please contact the portal administrator.");
+    return;
+  }
+
   APP.profile = profile;
-  APP.role = profile.role === CONFIG.roles.staff ? CONFIG.roles.staff : CONFIG.roles.student;
+  APP.role = profile.role === CONFIG.roles.admin ? CONFIG.roles.admin
+    : profile.role === CONFIG.roles.staff ? CONFIG.roles.staff
+    : CONFIG.roles.student;
 
   SessionManager.start(() => handleLogout("Your session expired due to inactivity. Please log in again."));
 
-  if (APP.role === CONFIG.roles.staff) await renderStaffShell();
+  if (APP.role === CONFIG.roles.admin) await renderAdminShell();
+  else if (APP.role === CONFIG.roles.staff) await renderStaffShell();
   else await renderStudentShell();
 }
 
@@ -270,7 +295,7 @@ function renderLoginScreen(message) {
 
         <div class="login-tabs" role="tablist">
           <button type="button" data-tab="student" class="active" role="tab">Student</button>
-          <button type="button" data-tab="staff" role="tab">Staff</button>
+          <button type="button" data-tab="staff" role="tab">Staff / Admin</button>
         </div>
 
         <div class="login-form-panel active" data-panel="student">
@@ -290,8 +315,8 @@ function renderLoginScreen(message) {
         <div class="login-form-panel" data-panel="staff">
           <form id="staffLoginForm" novalidate>
             <div class="field">
-              <label for="staffEmail">Email</label>
-              <input type="email" id="staffEmail" placeholder="staff@exampleedu.com" autocomplete="username" required>
+              <label for="staffEmail">Staff ID or Admin Email</label>
+              <input type="text" id="staffEmail" placeholder="e.g. Staff or Admin@exampleedu.com" autocomplete="username" required>
             </div>
             <div class="field">
               <label for="staffPassword">Password</label>
@@ -560,58 +585,189 @@ function renderHelpPage(main) {
 
 /* ================================ STAFF ================================ */
 
-const StaffState = { page: 0, pageSize: 10, search: "", totalCount: 0, rows: [], selectedIds: new Set() };
+// Shared by Staff's "Students" page (read-only) and Admin's "Students"
+// page (full CRUD) via the `adminMode` flag — one table/search/paginate
+// implementation, not two. StaffState.adminMode also gates which
+// buttons render, never which DATA loads: the real permission boundary
+// is server-side RLS (is_admin()), not this flag.
+const StaffState = { page: 0, pageSize: 10, search: "", totalCount: 0, rows: [], selectedIds: new Set(), adminMode: false };
 
-// Staff/Admin keeps every student-facing capability (their own
-// Dashboard/Result/Fees/Profile — reusing the exact same render
-// functions STUDENT uses, not a fork of them) PLUS the admin-only
-// Students and Result Export tools. Nothing below duplicates logic
-// that already exists in the STUDENT section.
 async function renderStaffShell() {
   mountAppShell({
     navItems: [
       { key: "dashboard", label: "Dashboard" },
-      { key: "results", label: "Result" },
-      { key: "fees", label: "Fees" },
-      { key: "profile", label: "Profile" },
       { key: "students", label: "Students" },
-      { key: "resultExport", label: "Result Export" },
+      { key: "reports", label: "Reports" },
+      { key: "profile", label: "Profile" },
       { key: "help", label: "Help" }
     ],
     onNav: (key) => showStaffView(key)
   });
-
-  // Needed so the shared renderStudentResults() view knows how many
-  // semester tabs to draw if the admin opens their own "Result" tab.
-  await loadCourseSemesterCount();
-  showStaffView("students");
+  showStaffView("dashboard");
 }
 
 function showStaffView(key) {
   setActiveNav(key);
   const main = document.getElementById("mainContent");
-  // Shared with STUDENT — same functions, same data shape, since a
-  // staff/admin account is still just a `profiles` row underneath.
-  if (key === "dashboard") return renderStudentDashboard(main);
-  if (key === "results") return renderStudentResults(main);
-  if (key === "fees") return renderStudentFees(main);
-  if (key === "profile") return renderStudentProfile(main);
-  // Admin-only.
-  if (key === "students") return renderStaffStudents(main);
-  if (key === "resultExport") return renderStaffResultExport(main);
+  if (key === "dashboard") return renderStaffDashboard(main);
+  if (key === "students") { StaffState.adminMode = false; return renderStaffStudents(main); }
+  if (key === "reports") return renderStaffResultExport(main);
+  if (key === "profile") return renderStaffAdminProfile(main);
   if (key === "help") return renderHelpPage(main);
+}
+
+// Staff's own dashboard — deliberately NOT the student dashboard.
+// No Current Semester / Attendance / CGPA / Arrears / Fees Pending
+// here; those are student-only concepts and this account isn't
+// enrolled as a student. Reused as-is by Admin's dashboard below.
+async function renderStaffDashboard(main) {
+  main.innerHTML = `
+    <div class="container">
+      <div class="page-head">
+        <span class="eyebrow">Staff Dashboard</span>
+        <h1>Welcome, ${escapeHtml(APP.profile.name)}</h1>
+        <p>${CONFIG.collegeName}</p>
+      </div>
+      <div id="dashboardWidgets" class="loading-block"><div class="spinner"></div></div>
+    </div>
+  `;
+  await renderOperationalDashboardWidgets(document.getElementById("dashboardWidgets"), { extraKpis: [] });
+}
+
+// The actual widget set (KPI + admissions chart + class chart +
+// timetable + announcements), built from real `profiles`/`exam_timetable`/
+// `announcements` data only — nothing here is fabricated. Shared by
+// Staff and Admin dashboards; `extraKpis` lets Admin add its own cards
+// without forking this function.
+async function renderOperationalDashboardWidgets(container, { extraKpis = [] } = {}) {
+  try {
+    const sb = getSupabase();
+
+    const [{ data: students, error: studentsError }, { data: timetable }, { data: news }] = await Promise.all([
+      sb.from(CONFIG.tables.profiles).select("batch, year").eq("role", CONFIG.roles.student).eq("is_active", true),
+      sb.from(CONFIG.tables.examTimetable).select("*, subjects(subject_name), courses(name)").gte("exam_date", new Date().toISOString().slice(0, 10)).order("exam_date", { ascending: true }).limit(5),
+      sb.from(CONFIG.tables.announcements).select("*").eq("is_active", true).order("created_at", { ascending: false }).limit(5)
+    ]);
+    if (studentsError) throw new AppError("We couldn't load the dashboard right now.", studentsError);
+
+    const rows = students || [];
+
+    // Admissions by Year — parsed from the existing `batch` field
+    // (e.g. "2023-2026" -> 2023). No new table, no invented numbers;
+    // if batch is missing/unparseable for a student, they're simply
+    // excluded from this chart rather than guessed at.
+    const admissionCounts = new Map();
+    rows.forEach((s) => {
+      const match = String(s.batch || "").match(/^(\d{4})/);
+      if (!match) return;
+      const year = match[1];
+      admissionCounts.set(year, (admissionCounts.get(year) || 0) + 1);
+    });
+    const admissionPairs = [...admissionCounts.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+
+    // Students by Year — from the existing `year` field.
+    const yearCounts = new Map();
+    rows.forEach((s) => { const y = s.year || "Unspecified"; yearCounts.set(y, (yearCounts.get(y) || 0) + 1); });
+    const yearPairs = [...yearCounts.entries()];
+
+    container.innerHTML = `
+      <div class="stat-grid" style="margin-bottom:28px;">
+        <div class="stat-card"><div class="stat-label">Active Students</div><div class="stat-value">${rows.length}</div></div>
+        ${extraKpis.map((k) => `<div class="stat-card${k.seal ? " seal-card" : ""}"><div class="stat-label">${escapeHtml(k.label)}</div><div class="stat-value">${k.value}</div></div>`).join("")}
+      </div>
+
+      <div class="section-card">
+        <h2>Admissions by Year</h2>
+        ${admissionPairs.length
+          ? renderBarChart(admissionPairs)
+          : `<div class="empty-state"><div class="glyph">＋</div><h3>No Admissions Data Yet</h3><p>This chart is built from each student's <code>batch</code> field (e.g. "2023-2026"). Seed or edit student batches to populate it.</p></div>`}
+      </div>
+
+      <div class="section-card">
+        <h2>Students by Year</h2>
+        ${yearPairs.length
+          ? renderBarChart(yearPairs, { barColor: "var(--accent-secondary)" })
+          : `<div class="empty-state"><h3>No Student Data Yet</h3></div>`}
+      </div>
+
+      <div class="section-card">
+        <h2>Upcoming Examination Timetable</h2>
+        ${(timetable && timetable.length) ? `
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            ${timetable.map((t) => `
+              <div class="quick-link-card" style="text-align:left; cursor:default;">
+                <div class="stat-label">${formatDate(t.exam_date)}${t.exam_time ? " · " + escapeHtml(t.exam_time) : ""}</div>
+                <strong>${escapeHtml(t.subjects?.subject_name || "Subject TBD")}</strong>
+                <div style="color:var(--text-muted); font-size:13px; margin-top:4px;">${escapeHtml(t.courses?.name || "")}${t.semester ? " · Semester " + t.semester : ""}${t.venue ? " · " + escapeHtml(t.venue) : ""}</div>
+              </div>
+            `).join("")}
+          </div>
+        ` : `<div class="empty-state"><div class="glyph">＋</div><h3>No Upcoming Exams Scheduled</h3><p>Add rows to <code>exam_timetable</code> to populate this section.</p></div>`}
+      </div>
+
+      <div class="section-card" id="announcementsCard">
+        <h2>News &amp; Announcements</h2>
+        <div id="announcementsList">
+          ${(news && news.length) ? news.map((n) => `
+            <div class="quick-link-card" style="text-align:left; cursor:default; margin-bottom:10px;">
+              <strong>${escapeHtml(n.title)}</strong>
+              <p style="color:var(--text-secondary); font-size:13.5px; margin-top:6px;">${escapeHtml(n.body)}</p>
+              <div style="color:var(--text-muted); font-size:12px; margin-top:6px;">${formatDate(n.created_at)}</div>
+            </div>
+          `).join("") : `<div class="empty-state"><div class="glyph">＋</div><h3>No Announcements Yet</h3><p>Nothing posted yet.</p></div>`}
+        </div>
+        <div id="postAnnouncementSlot"></div>
+      </div>
+    `;
+
+    if (APP.role === CONFIG.roles.admin) renderPostAnnouncementForm(document.getElementById("postAnnouncementSlot"));
+  } catch (err) {
+    handleAppError(err);
+    container.innerHTML = `<div class="empty-state"><h3>Unable to load dashboard</h3><p>Please try again.</p></div>`;
+  }
+}
+
+function renderPostAnnouncementForm(slot) {
+  if (!slot) return;
+  slot.innerHTML = `
+    <form id="announcementForm" style="margin-top:18px; border-top:1px solid var(--border); padding-top:18px;">
+      <div class="field"><label for="announcementTitle">Post an Announcement</label><input type="text" id="announcementTitle" placeholder="Title" required></div>
+      <div class="field"><textarea id="announcementBody" rows="3" placeholder="Details" required style="padding:12px 16px; border-radius:var(--radius-sm); border:1px solid var(--border); background:var(--bg-secondary); color:var(--text); font-family:inherit; font-size:14px; resize:vertical;"></textarea></div>
+      <button type="submit" class="btn btn-primary" id="announcementSubmitBtn">Post</button>
+    </form>
+  `;
+  document.getElementById("announcementForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById("announcementSubmitBtn");
+    btn.disabled = true;
+    try {
+      const sb = getSupabase();
+      const { error } = await sb.from(CONFIG.tables.announcements).insert({
+        title: document.getElementById("announcementTitle").value.trim(),
+        body: document.getElementById("announcementBody").value.trim(),
+        posted_by: APP.profile.id
+      });
+      if (error) throw new AppError("Unable to post the announcement.", error);
+      showToast("Announcement posted.", "success");
+      await showAdminView("dashboard");
+    } catch (err) {
+      handleAppError(err);
+      btn.disabled = false;
+    }
+  });
 }
 
 function renderStaffStudents(main) {
   main.innerHTML = `
     <div class="container">
-      <div class="page-head"><span class="eyebrow">Administration</span><h1>Student Records</h1><p>Search, review, and export student data.</p></div>
+      <div class="page-head"><span class="eyebrow">${StaffState.adminMode ? "Administration" : "Records"}</span><h1>Student Records</h1><p>${StaffState.adminMode ? "Search, manage, and export student data." : "Search, review, and export student data."}</p></div>
 
       <div class="results-toolbar">
         <div class="field" style="margin:0; min-width:260px;">
           <input type="text" id="staffSearch" placeholder="Search by register number, name, course, or batch">
         </div>
         <div class="button-row">
+          ${StaffState.adminMode ? `<button class="btn btn-primary" id="addStudentBtn" type="button">Add Student</button>` : ""}
           <button class="btn btn-outline" id="exportExcelBtn" type="button">Export Excel</button>
           <button class="btn btn-outline" id="exportPdfBtn" type="button">Export Selected PDF</button>
         </div>
@@ -630,6 +786,7 @@ function renderStaffStudents(main) {
 
   document.getElementById("exportExcelBtn").addEventListener("click", () => exportStudentsExcel());
   document.getElementById("exportPdfBtn").addEventListener("click", () => exportSelectedStudentsPdf());
+  document.getElementById("addStudentBtn")?.addEventListener("click", () => openStudentFormModal(null));
 
   loadStaffStudents();
 }
@@ -671,27 +828,43 @@ function renderStaffTable() {
     return;
   }
 
+  const cols = StaffState.adminMode ? "30px 90px 1.2fr 80px 70px 70px 70px 80px 150px" : "30px 90px 1.4fr 90px 80px 80px 80px 90px";
+
   wrap.innerHTML = `
-    <div class="ledger-head" style="grid-template-columns: 30px 90px 1.4fr 90px 80px 80px 80px 90px;">
-      <div></div><div>Reg No</div><div>Name</div><div>Course</div><div>Sem</div><div>CGPA</div><div>Arrears</div><div>Fees</div>
+    <div class="ledger-head" style="grid-template-columns: ${cols};">
+      <div></div><div>Reg No</div><div>Name</div><div>Course</div><div>Sem</div><div>CGPA</div><div>Arrears</div><div>Fees</div>${StaffState.adminMode ? "<div>Actions</div>" : ""}
     </div>
     ${StaffState.rows.map((s) => `
-      <div class="ledger-row" style="grid-template-columns: 30px 90px 1.4fr 90px 80px 80px 80px 90px;" data-id="${s.id}">
+      <div class="ledger-row" style="grid-template-columns: ${cols}; ${StaffState.adminMode ? "cursor:default;" : ""}" data-id="${s.id}">
         <div><input type="checkbox" class="staff-select" data-id="${s.id}" ${StaffState.selectedIds.has(s.id) ? "checked" : ""}></div>
         <div class="mono">${escapeHtml(s.register_number)}</div>
-        <div class="subject-name">${escapeHtml(s.name)}</div>
+        <div class="subject-name">${escapeHtml(s.name)} ${s.is_active === false ? '<span class="badge badge-fail" style="margin-left:6px;">INACTIVE</span>' : ""}</div>
         <div>${escapeHtml(s.course)}</div>
         <div>${s.current_semester ?? "—"}</div>
         <div class="mono">${s.cgpa != null ? Number(s.cgpa).toFixed(2) : "—"}</div>
         <div>${s.arrears ?? 0}</div>
         <div class="mono">${formatCurrency(s.fees_pending)}</div>
+        ${StaffState.adminMode ? `
+          <div class="button-row" style="gap:6px;">
+            <button class="btn btn-ghost" style="height:32px; padding:0 10px; font-size:12.5px;" data-view="${s.id}">View</button>
+            <button class="btn btn-ghost" style="height:32px; padding:0 10px; font-size:12.5px;" data-edit="${s.id}">Edit</button>
+            <button class="btn btn-ghost" style="height:32px; padding:0 10px; font-size:12.5px; color:var(--danger);" data-toggle="${s.id}">${s.is_active === false ? "Reactivate" : "Deactivate"}</button>
+          </div>
+        ` : ""}
       </div>
     `).join("")}
   `;
 
-  wrap.querySelectorAll(".ledger-row").forEach((row) => {
-    row.addEventListener("click", (e) => { if (!e.target.classList.contains("staff-select")) openStudentDetail(Number(row.dataset.id)); });
-  });
+  if (!StaffState.adminMode) {
+    wrap.querySelectorAll(".ledger-row").forEach((row) => {
+      row.addEventListener("click", (e) => { if (!e.target.classList.contains("staff-select")) openStudentDetail(Number(row.dataset.id)); });
+    });
+  } else {
+    wrap.querySelectorAll("[data-view]").forEach((b) => b.addEventListener("click", () => openStudentDetail(Number(b.dataset.view))));
+    wrap.querySelectorAll("[data-edit]").forEach((b) => b.addEventListener("click", () => openStudentFormModal(StaffState.rows.find((s) => s.id === Number(b.dataset.edit)))));
+    wrap.querySelectorAll("[data-toggle]").forEach((b) => b.addEventListener("click", () => toggleStudentActive(StaffState.rows.find((s) => s.id === Number(b.dataset.toggle)))));
+  }
+
   wrap.querySelectorAll(".staff-select").forEach((cb) => {
     cb.addEventListener("click", (e) => e.stopPropagation());
     cb.addEventListener("change", (e) => {
@@ -739,14 +912,120 @@ async function openStudentDetail(profileId) {
       ${infoItem("Fees Pending", formatCurrency(student.fees_pending))}
       ${infoItem("College", student.college || CONFIG.collegeName)}
       ${infoItem("University", student.university || CONFIG.universityName)}
+      ${infoItem("Status", student.is_active === false ? "Inactive" : "Active")}
     </div>
     <div class="button-row" style="margin-top:20px;">
       <button class="btn btn-primary" id="detailPdfBtn">Download Record PDF</button>
+      ${StaffState.adminMode ? `<button class="btn btn-outline" id="detailEditBtn">Edit Student</button>` : ""}
     </div>
   `);
 
   document.getElementById("detailPdfBtn").addEventListener("click", () => exportStudentRecordPdf(student));
+  document.getElementById("detailEditBtn")?.addEventListener("click", () => openStudentFormModal(student));
   loadAvatarInto(document.querySelector("#modalBody .avatar img"), student);
+}
+
+// ADMIN ONLY — reached only via a button rendered when StaffState.adminMode
+// is true, which is only ever set when showAdminView("students") runs
+// (itself only reachable through the Admin shell). The real boundary is still
+// server-side: every write below goes through RLS's is_admin() check,
+// so even a manually-triggered call from a non-admin session is
+// rejected at the database regardless of what the UI shows.
+function openStudentFormModal(student) {
+  const isEdit = !!student;
+  showModal(`
+    <div class="modal-head"><h3>${isEdit ? "Edit Student" : "Add Student"}</h3><button class="modal-close" onclick="closeModal()">&times;</button></div>
+    <form id="studentForm" style="display:flex; flex-direction:column; gap:14px;">
+      <div class="field"><label>Register Number (4 digits)</label><input type="text" id="f_register_number" value="${escapeHtml(student?.register_number || "")}" maxlength="4" pattern="\\d{4}" required></div>
+      <div class="field"><label>Name</label><input type="text" id="f_name" value="${escapeHtml(student?.name || "")}" required></div>
+      <div class="field"><label>Gender</label><input type="text" id="f_gender" value="${escapeHtml(student?.gender || "")}"></div>
+      <div class="field"><label>Date of Birth</label><input type="date" id="f_dob" value="${student?.dob || ""}" required></div>
+      <div class="field"><label>Phone</label><input type="text" id="f_phone" value="${escapeHtml(student?.phone || "")}"></div>
+      <div class="field"><label>Parent Phone</label><input type="text" id="f_parent_phone" value="${escapeHtml(student?.parent_phone || "")}"></div>
+      <div class="field"><label>Guardian</label><input type="text" id="f_guardian" value="${escapeHtml(student?.guardian || "")}"></div>
+      <div class="field"><label>Address</label><input type="text" id="f_address" value="${escapeHtml(student?.address || "")}"></div>
+      <div class="field"><label>Blood Group</label><input type="text" id="f_blood_group" value="${escapeHtml(student?.blood_group || "")}"></div>
+      <div class="field"><label>Course</label><input type="text" id="f_course" value="${escapeHtml(student?.course || "BCA")}" required></div>
+      <div class="field"><label>Batch</label><input type="text" id="f_batch" value="${escapeHtml(student?.batch || "")}" placeholder="e.g. 2024-2027"></div>
+      <div class="field"><label>Year</label><input type="text" id="f_year" value="${escapeHtml(student?.year || "")}" placeholder="e.g. I Year"></div>
+      <div class="field"><label>Current Semester</label><input type="number" id="f_current_semester" min="1" max="8" value="${student?.current_semester ?? ""}"></div>
+      <div class="field"><label>Attendance %</label><input type="number" id="f_attendance" min="0" max="100" step="0.01" value="${student?.attendance_percentage ?? ""}"></div>
+      ${isEdit ? `<div class="field"><label>Change Photo</label><input type="file" id="f_photo" accept="image/png,image/jpeg,image/webp"></div>` : ""}
+      <p id="studentFormMessage" style="color:var(--danger); font-size:13px; min-height:1em;"></p>
+      <div class="button-row">
+        <button type="button" class="btn btn-outline" onclick="closeModal()">Cancel</button>
+        <button type="submit" class="btn btn-primary" id="studentFormSubmit">${isEdit ? "Save Changes" : "Add Student"}</button>
+      </div>
+    </form>
+  `);
+
+  document.getElementById("studentForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById("studentFormSubmit");
+    const msg = document.getElementById("studentFormMessage");
+    btn.disabled = true;
+    msg.textContent = "";
+
+    const payload = {
+      register_number: document.getElementById("f_register_number").value.trim(),
+      name: document.getElementById("f_name").value.trim(),
+      gender: document.getElementById("f_gender").value.trim() || null,
+      dob: document.getElementById("f_dob").value,
+      phone: document.getElementById("f_phone").value.trim() || null,
+      parent_phone: document.getElementById("f_parent_phone").value.trim() || null,
+      guardian: document.getElementById("f_guardian").value.trim() || null,
+      address: document.getElementById("f_address").value.trim() || null,
+      blood_group: document.getElementById("f_blood_group").value.trim() || null,
+      course: document.getElementById("f_course").value.trim(),
+      batch: document.getElementById("f_batch").value.trim() || null,
+      year: document.getElementById("f_year").value.trim() || null,
+      current_semester: document.getElementById("f_current_semester").value ? Number(document.getElementById("f_current_semester").value) : null,
+      attendance_percentage: document.getElementById("f_attendance").value ? Number(document.getElementById("f_attendance").value) : null
+    };
+
+    try {
+      const sb = getSupabase();
+      let targetId = student?.id;
+
+      if (isEdit) {
+        const { error } = await sb.from(CONFIG.tables.profiles).update(payload).eq("id", student.id);
+        if (error) throw error;
+      } else {
+        payload.role = CONFIG.roles.student;
+        const { data, error } = await sb.from(CONFIG.tables.profiles).insert(payload).select("id").single();
+        if (error) throw error;
+        targetId = data.id;
+      }
+
+      const photoFile = document.getElementById("f_photo")?.files?.[0];
+      if (photoFile) await uploadAvatar(photoFile, { id: targetId, role: "student" });
+
+      showToast(isEdit ? "Student updated." : "Student added.", "success");
+      closeModal();
+      loadStaffStudents();
+    } catch (err) {
+      msg.textContent = err.message?.includes("register_number")
+        ? "That register number is already in use or isn't exactly 4 digits."
+        : (err.message || "Unable to save. Please check the form and try again.");
+      btn.disabled = false;
+    }
+  });
+}
+
+async function toggleStudentActive(student) {
+  if (!student) return;
+  const action = student.is_active === false ? "reactivate" : "deactivate";
+  if (!confirm(`${action === "deactivate" ? "Deactivate" : "Reactivate"} ${student.name} (${student.register_number})?`)) return;
+
+  try {
+    const sb = getSupabase();
+    const { error } = await sb.from(CONFIG.tables.profiles).update({ is_active: action === "reactivate" }).eq("id", student.id);
+    if (error) throw error;
+    showToast(`Student ${action}d.`, "success");
+    loadStaffStudents();
+  } catch (err) {
+    showToast(err.message || "Unable to update this student.", "error");
+  }
 }
 
 function renderStaffResultExport(main) {
@@ -806,6 +1085,206 @@ function renderStaffResultExport(main) {
   document.getElementById("exportAllPdfBtn").addEventListener("click", () => {
     if (selectedStudent) exportStaffAllSemestersPdf(selectedStudent);
   });
+}
+
+/* ================================ ADMIN ================================ */
+
+async function renderAdminShell() {
+  mountAppShell({
+    navItems: [
+      { key: "dashboard", label: "Dashboard" },
+      { key: "students", label: "Students" },
+      { key: "staff", label: "Staff" },
+      { key: "reports", label: "Reports" },
+      { key: "profile", label: "Profile" },
+      { key: "help", label: "Help" }
+    ],
+    onNav: (key) => showAdminView(key)
+  });
+  showAdminView("dashboard");
+}
+
+function showAdminView(key) {
+  setActiveNav(key);
+  const main = document.getElementById("mainContent");
+  if (key === "dashboard") return renderAdminDashboard(main);
+  if (key === "students") { StaffState.adminMode = true; return renderStaffStudents(main); }
+  if (key === "staff") return renderAdminStaffManagement(main);
+  if (key === "reports") return renderStaffResultExport(main);
+  if (key === "profile") return renderStaffAdminProfile(main);
+  if (key === "help") return renderHelpPage(main);
+}
+
+async function renderAdminDashboard(main) {
+  main.innerHTML = `
+    <div class="container">
+      <div class="page-head">
+        <span class="eyebrow">Admin Dashboard</span>
+        <h1>Welcome, ${escapeHtml(APP.profile.name)}</h1>
+        <p>${CONFIG.collegeName}</p>
+      </div>
+      <div id="dashboardWidgets" class="loading-block"><div class="spinner"></div></div>
+    </div>
+  `;
+
+  let extraKpis = [];
+  try {
+    const sb = getSupabase();
+    const { data: staffAndAdmins } = await sb.from(CONFIG.tables.profiles).select("role").in("role", [CONFIG.roles.staff, CONFIG.roles.admin]).eq("is_active", true);
+    const staffCount = (staffAndAdmins || []).filter((p) => p.role === CONFIG.roles.staff).length;
+    const adminCount = (staffAndAdmins || []).filter((p) => p.role === CONFIG.roles.admin).length;
+    extraKpis = [
+      { label: "Active Staff", value: staffCount },
+      { label: "Active Admins", value: adminCount, seal: true }
+    ];
+  } catch (err) {
+    console.error(err);
+  }
+
+  await renderOperationalDashboardWidgets(document.getElementById("dashboardWidgets"), { extraKpis });
+}
+
+// Staff + Admin accounts only (role IN staff/admin) — students are
+// managed on the Students page, not here.
+async function renderAdminStaffManagement(main) {
+  main.innerHTML = `
+    <div class="container">
+      <div class="page-head"><span class="eyebrow">Administration</span><h1>Staff &amp; Admin Accounts</h1><p>Manage staff/admin profiles. Creating a record here does not by itself create a login — see the note after adding one.</p></div>
+      <div class="results-toolbar"><div></div><div class="button-row"><button class="btn btn-primary" id="addStaffBtn" type="button">Add Staff/Admin</button></div></div>
+      <div class="ledger" id="staffMgmtWrap"><div class="loading-block"><div class="spinner"></div></div></div>
+    </div>
+  `;
+
+  document.getElementById("addStaffBtn").addEventListener("click", () => openStaffFormModal(null));
+  await loadStaffAccounts();
+}
+
+async function loadStaffAccounts() {
+  const wrap = document.getElementById("staffMgmtWrap");
+  try {
+    const sb = getSupabase();
+    const { data, error } = await sb.from(CONFIG.tables.profiles).select("*").in("role", [CONFIG.roles.staff, CONFIG.roles.admin]).order("role").order("name");
+    if (error) throw new AppError("We couldn't load staff accounts right now.", error);
+
+    if (!data.length) { wrap.innerHTML = `<div class="empty-state"><h3>No Staff/Admin Accounts</h3></div>`; return; }
+
+    wrap.innerHTML = `
+      <div class="ledger-head" style="grid-template-columns: 1.3fr 110px 100px 90px 230px;"><div>Name</div><div>Login ID</div><div>Role</div><div>Status</div><div>Actions</div></div>
+      ${data.map((p) => `
+        <div class="ledger-row" style="grid-template-columns: 1.3fr 110px 100px 90px 230px; cursor:default;">
+          <div class="subject-name">${escapeHtml(p.name)}</div>
+          <div class="mono">${escapeHtml(p.login_id || "—")}</div>
+          <div><span class="badge ${p.role === "admin" ? "badge-pass" : "badge-fail"}" style="background:var(--bg-secondary); color:var(--text);">${p.role.toUpperCase()}</span></div>
+          <div>${p.is_active === false ? '<span class="badge badge-fail">INACTIVE</span>' : '<span class="badge badge-pass">ACTIVE</span>'}</div>
+          <div class="button-row" style="gap:6px;">
+            <button class="btn btn-ghost" style="height:32px; padding:0 10px; font-size:12.5px;" data-edit="${p.id}">Edit</button>
+            <button class="btn btn-ghost" style="height:32px; padding:0 10px; font-size:12.5px;" data-reset="${p.id}">Reset Password</button>
+            <button class="btn btn-ghost" style="height:32px; padding:0 10px; font-size:12.5px; color:var(--danger);" data-toggle="${p.id}">${p.is_active === false ? "Reactivate" : "Deactivate"}</button>
+          </div>
+        </div>
+      `).join("")}
+    `;
+
+    wrap.querySelectorAll("[data-edit]").forEach((b) => b.addEventListener("click", () => openStaffFormModal(data.find((p) => p.id === Number(b.dataset.edit)))));
+    wrap.querySelectorAll("[data-reset]").forEach((b) => b.addEventListener("click", () => openResetPasswordInfoModal(data.find((p) => p.id === Number(b.dataset.reset)))));
+    wrap.querySelectorAll("[data-toggle]").forEach((b) => b.addEventListener("click", () => toggleStaffActive(data.find((p) => p.id === Number(b.dataset.toggle)))));
+  } catch (err) {
+    handleAppError(err);
+    wrap.innerHTML = `<div class="empty-state"><h3>Unable to load staff accounts</h3></div>`;
+  }
+}
+
+function openStaffFormModal(staff) {
+  const isEdit = !!staff;
+  showModal(`
+    <div class="modal-head"><h3>${isEdit ? "Edit Staff/Admin" : "Add Staff/Admin"}</h3><button class="modal-close" onclick="closeModal()">&times;</button></div>
+    <form id="staffForm" style="display:flex; flex-direction:column; gap:14px;">
+      <div class="field"><label>Display Name</label><input type="text" id="s_name" value="${escapeHtml(staff?.name || "")}" required></div>
+      <div class="field"><label>Login ID ${isEdit ? "" : "(no spaces — this is what they'll type to log in)"}</label><input type="text" id="s_login_id" value="${escapeHtml(staff?.login_id || "")}" ${isEdit ? "readonly" : ""} required></div>
+      <div class="field"><label>Role</label>
+        <select id="s_role">
+          <option value="staff" ${staff?.role === "staff" ? "selected" : ""}>Staff</option>
+          <option value="admin" ${staff?.role === "admin" ? "selected" : ""}>Admin</option>
+        </select>
+      </div>
+      ${isEdit ? `<div class="field"><label>Change Photo</label><input type="file" id="s_photo" accept="image/png,image/jpeg,image/webp"></div>` : ""}
+      ${!isEdit ? `<p style="color:var(--text-muted); font-size:12.5px;">This creates the profile record only. To actually activate their login, run on a secure machine: <code>node scripts/provision-auth-users.mjs</code> (picks up every staff/admin profile missing a login automatically).</p>` : ""}
+      <p id="staffFormMessage" style="color:var(--danger); font-size:13px; min-height:1em;"></p>
+      <div class="button-row">
+        <button type="button" class="btn btn-outline" onclick="closeModal()">Cancel</button>
+        <button type="submit" class="btn btn-primary" id="staffFormSubmit">${isEdit ? "Save Changes" : "Add Account"}</button>
+      </div>
+    </form>
+  `);
+
+  document.getElementById("staffForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById("staffFormSubmit");
+    const msg = document.getElementById("staffFormMessage");
+    btn.disabled = true;
+    msg.textContent = "";
+
+    try {
+      const sb = getSupabase();
+      const name = document.getElementById("s_name").value.trim();
+      const role = document.getElementById("s_role").value;
+      let targetId = staff?.id;
+
+      if (isEdit) {
+        const { error } = await sb.from(CONFIG.tables.profiles).update({ name, role }).eq("id", staff.id);
+        if (error) throw error;
+      } else {
+        const login_id = document.getElementById("s_login_id").value.trim();
+        const { data, error } = await sb.from(CONFIG.tables.profiles).insert({ role, login_id, name, college: CONFIG.collegeName, university: CONFIG.universityName }).select("id").single();
+        if (error) throw error;
+        targetId = data.id;
+      }
+
+      const photoFile = document.getElementById("s_photo")?.files?.[0];
+      if (photoFile) await uploadAvatar(photoFile, { id: targetId, role, auth_user_id: staff?.auth_user_id });
+
+      showToast(isEdit ? "Account updated." : "Account added — remember to run the provisioning script.", "success");
+      closeModal();
+      loadStaffAccounts();
+    } catch (err) {
+      msg.textContent = err.message?.includes("last active admin")
+        ? "Cannot change the last active admin's role."
+        : (err.message || "Unable to save. Please try again.");
+      btn.disabled = false;
+    }
+  });
+}
+
+async function toggleStaffActive(staff) {
+  if (!staff) return;
+  const action = staff.is_active === false ? "reactivate" : "deactivate";
+  if (!confirm(`${action === "deactivate" ? "Deactivate" : "Reactivate"} ${staff.name} (${staff.login_id})?`)) return;
+
+  try {
+    const sb = getSupabase();
+    const { error } = await sb.from(CONFIG.tables.profiles).update({ is_active: action === "reactivate" }).eq("id", staff.id);
+    if (error) throw error;
+    showToast(`Account ${action}d.`, "success");
+    loadStaffAccounts();
+  } catch (err) {
+    // Surfaces the database trigger's own message when it's the
+    // last-admin guard firing — not a generic failure.
+    showToast(err.message?.includes("last active admin") ? err.message : (err.message || "Unable to update this account."), "error");
+  }
+}
+
+// Admin resetting SOMEONE ELSE's password genuinely cannot be done
+// from the browser — it requires the Supabase service-role key, which
+// must never be shipped to client code. This is the honest UI for
+// that limitation: it tells the admin exactly what to run, rather
+// than pretending a button here could do it.
+function openResetPasswordInfoModal(staff) {
+  showModal(`
+    <div class="modal-head"><h3>Reset Password</h3><button class="modal-close" onclick="closeModal()">&times;</button></div>
+    <p style="color:var(--text-secondary); margin-bottom:14px;">Resetting ${escapeHtml(staff.name)}'s password requires the Supabase service-role key, which never runs in the browser. On a secure machine with that key set, run:</p>
+    <pre style="background:var(--bg-secondary); border:1px solid var(--border); border-radius:var(--radius-sm); padding:14px; font-family:var(--font-mono); font-size:12.5px; overflow-x:auto;">node scripts/provision-auth-users.mjs --reset-password ${escapeHtml(staff.login_id || "")} &lt;new-password&gt;</pre>
+    <div class="button-row" style="margin-top:16px;"><button class="btn btn-primary" onclick="closeModal()">Got it</button></div>
+  `);
 }
 
 /* =============================== RESULTS =============================== */
@@ -1157,7 +1636,7 @@ async function submitArrearApplication(checkboxes) {
 function resolveAvatarUrl(profile) {
   // Synchronous fallback shown immediately; loadAvatarInto() upgrades it
   // to the real photo (a signed URL) once fetched.
-  return `https://ui-avatars.com/api/?name=${encodeURIComponent(profile.name || "Student")}&background=9A5B12&color=fff8ec&size=200`;
+  return `https://ui-avatars.com/api/?name=${encodeURIComponent(profile.name || "User")}&background=9A5B12&color=fff8ec&size=200`;
 }
 
 async function loadAvatarInto(imgEl, profile) {
@@ -1170,41 +1649,71 @@ async function loadAvatarInto(imgEl, profile) {
   } catch (err) { console.warn("Avatar load skipped:", err.message); }
 }
 
-async function uploadAvatar(file) {
+// Where a profile's photo lives in storage. Students (no auth.uid(),
+// see AUTH section) are keyed by their profile id under a `students/`
+// prefix, matching the anon storage policies in
+// add-admin-staff-roles.sql. Staff/Admin (real auth.uid()) are keyed
+// by that uid, matching the original, fully-secure self-only storage
+// policies from database.sql. A staff/admin profile Admin has just
+// created but not yet provisioned (no auth_user_id yet) falls back to
+// an id-based path — the admin-bypass storage policy covers writing
+// there regardless.
+function avatarPathFor(profile) {
+  if (profile.role === CONFIG.roles.student) return `students/${profile.id}/avatar`;
+  if (profile.auth_user_id) return `${profile.auth_user_id}/avatar`;
+  return `staff/${profile.id}/avatar`;
+}
+
+// `targetProfile` defaults to the caller's own profile (self-service
+// upload — the overwhelmingly common case: a student or staff/admin
+// changing their own photo). Admin management screens pass a specific
+// OTHER profile explicitly; the data write still goes through RLS
+// (is_admin() required for anyone but the row's own owner), so passing
+// an arbitrary target here does not itself grant access.
+async function uploadAvatar(file, targetProfile = APP.profile) {
   if (!CONFIG.allowedAvatarTypes.includes(file.type)) { showToast("Please upload a JPG, PNG, or WEBP image.", "error"); return; }
   if (file.size > CONFIG.maxAvatarSizeBytes) { showToast("Image is too large. Please choose a file under 2MB.", "error"); return; }
 
+  const isSelf = targetProfile.id === APP.profile.id;
   showToast("Uploading photo…", "info");
+
   try {
     const sb = getSupabase();
     const ext = file.name.split(".").pop();
-    const path = `${APP.user.id}/avatar.${ext}`;
+    const path = `${avatarPathFor(targetProfile)}.${ext}`;
 
     const { error: uploadError } = await sb.storage.from(CONFIG.avatarBucket).upload(path, file, { upsert: true, cacheControl: "3600" });
-    if (uploadError) throw new AppError("Unable to upload your photo. Please try again.", uploadError);
+    if (uploadError) throw new AppError("Unable to upload the photo. Please try again.", uploadError);
 
-    const { error: updateError } = await sb.from(CONFIG.tables.profiles).update({ profile_photo_path: path }).eq("id", APP.profile.id);
-    if (updateError) throw new AppError("Photo uploaded, but we couldn't save it to your profile.", updateError);
+    const { error: updateError } = await sb.from(CONFIG.tables.profiles).update({ profile_photo_path: path }).eq("id", targetProfile.id);
+    if (updateError) throw new AppError("Photo uploaded, but we couldn't save it to the profile.", updateError);
 
-    APP.profile.profile_photo_path = path;
-    await loadAvatarInto(document.getElementById("avatarImg"), APP.profile);
+    if (isSelf) {
+      APP.profile.profile_photo_path = path;
+      await loadAvatarInto(document.getElementById("avatarImg"), APP.profile);
+    }
     showToast("Profile photo updated.", "success");
   } catch (err) {
     handleAppError(err);
   }
 }
 
-// Personal → Academic → Financial → Institution, in that exact order.
+// Student Profile — trimmed to genuinely profile-level information.
+// CGPA/Arrears/Attendance live on Dashboard, full results on Results,
+// balance on Fees — not repeated here, per the "don't duplicate
+// information that already belongs to a dedicated page" requirement.
+// Personal → Academic (context only) → Institution, in that order,
+// plus an editable Display Name.
 function renderStudentProfile(main) {
   const p = APP.profile;
   main.innerHTML = `
     <div class="container">
-      <div class="page-head"><span class="eyebrow">Profile</span><h1>${escapeHtml(p.name)}</h1><p>Your personal, academic, and institution details.</p></div>
+      <div class="page-head"><span class="eyebrow">Profile</span><h1 id="studentProfileHeading">${escapeHtml(p.name)}</h1><p>Your personal and academic details.</p></div>
 
       <div class="profile-strip">
         <div class="avatar"><img id="avatarImg" alt="Profile photo" src="${resolveAvatarUrl(p)}" loading="lazy"></div>
         <div>
-          <h2>${escapeHtml(p.name)}</h2>
+          <h2 id="studentDisplayName">${escapeHtml(p.name)}</h2>
           <div class="profile-meta"><span>Reg. No <strong class="mono">${escapeHtml(p.register_number)}</strong></span></div>
           <div class="button-row" style="margin-top:14px;">
             <label class="btn btn-outline" style="cursor:pointer;">Change Photo<input type="file" id="avatarInput" accept="image/png,image/jpeg,image/webp" style="display:none;"></label>
@@ -1213,10 +1722,16 @@ function renderStudentProfile(main) {
       </div>
 
       <div class="section-card">
+        <h2>Display Name</h2>
+        <form id="nameForm" class="button-row" style="align-items:flex-end;">
+          <div class="field" style="flex:1; margin:0;"><label for="nameInput">Name</label><input type="text" id="nameInput" value="${escapeHtml(p.name)}" required></div>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+
+      <div class="section-card">
         <h2>Personal Information</h2>
         <div class="info-grid">
-          ${infoItem("Register Number", p.register_number)}
-          ${infoItem("Name", p.name)}
           ${infoItem("Gender", p.gender)}
           ${infoItem("Date of Birth", p.dob ? formatDate(p.dob) : "—")}
           ${infoItem("Blood Group", p.blood_group)}
@@ -1228,21 +1743,13 @@ function renderStudentProfile(main) {
       </div>
 
       <div class="section-card">
-        <h2>Academic Information</h2>
+        <h2>Academic Context</h2>
         <div class="info-grid">
           ${infoItem("Course", p.course)}
           ${infoItem("Batch", p.batch)}
           ${infoItem("Year", p.year)}
           ${infoItem("Current Semester", p.current_semester)}
-          ${infoItem("Attendance", p.attendance_percentage != null ? p.attendance_percentage + "%" : "—")}
-          ${infoItem("CGPA", p.cgpa != null ? Number(p.cgpa).toFixed(2) : "—")}
-          ${infoItem("Arrears", p.arrears ?? 0)}
         </div>
-      </div>
-
-      <div class="section-card">
-        <h2>Financial Information</h2>
-        <div class="info-grid">${infoItem("Fees Pending", formatCurrency(p.fees_pending))}</div>
       </div>
 
       <div class="section-card">
@@ -1257,6 +1764,128 @@ function renderStudentProfile(main) {
 
   document.getElementById("avatarInput")?.addEventListener("change", (e) => { const file = e.target.files?.[0]; if (file) uploadAvatar(file); });
   loadAvatarInto(document.getElementById("avatarImg"), p);
+
+  document.getElementById("nameForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const newName = document.getElementById("nameInput").value.trim();
+    if (!newName) return;
+    try {
+      const sb = getSupabase();
+      const { error } = await sb.from(CONFIG.tables.profiles).update({ name: newName }).eq("id", p.id);
+      if (error) throw error;
+      APP.profile.name = newName;
+      document.getElementById("studentDisplayName").textContent = newName;
+      document.getElementById("studentProfileHeading").textContent = newName;
+      showToast("Name updated.", "success");
+    } catch (err) {
+      showToast(err.message || "Unable to update name.", "error");
+    }
+  });
+}
+
+// Staff/Admin Profile — deliberately simple: photo, display name,
+// password change, institution, logout. No fees/results/CGPA/
+// attendance/arrears/register-number — those are student-only
+// concepts this account doesn't have.
+function renderStaffAdminProfile(main) {
+  const p = APP.profile;
+  main.innerHTML = `
+    <div class="container">
+      <div class="page-head"><span class="eyebrow">Profile</span><h1 id="staffProfileHeading">${escapeHtml(p.name)}</h1><p>${p.role === CONFIG.roles.admin ? "Administrator" : "Staff"} account.</p></div>
+
+      <div class="profile-strip">
+        <div class="avatar"><img id="avatarImg" alt="Profile photo" src="${resolveAvatarUrl(p)}" loading="lazy"></div>
+        <div>
+          <h2 id="staffDisplayName">${escapeHtml(p.name)}</h2>
+          <div class="profile-meta"><span>Login ID <strong class="mono">${escapeHtml(p.login_id || "—")}</strong></span></div>
+          <div class="button-row" style="margin-top:14px;">
+            <label class="btn btn-outline" style="cursor:pointer;">Change Photo<input type="file" id="avatarInput" accept="image/png,image/jpeg,image/webp" style="display:none;"></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-card">
+        <h2>Display Name</h2>
+        <form id="nameForm" class="button-row" style="align-items:flex-end;">
+          <div class="field" style="flex:1; margin:0;"><label for="nameInput">Name</label><input type="text" id="nameInput" value="${escapeHtml(p.name)}" required></div>
+          <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+      </div>
+
+      <div class="section-card">
+        <h2>Change Password</h2>
+        <form id="passwordForm" style="display:flex; flex-direction:column; gap:14px; max-width:360px;">
+          <div class="field"><label for="newPassword">New Password</label><input type="password" id="newPassword" minlength="6" required></div>
+          <div class="field"><label for="confirmPassword">Confirm Password</label><input type="password" id="confirmPassword" minlength="6" required></div>
+          <p id="passwordMessage" style="font-size:13px; min-height:1em;"></p>
+          <button type="submit" class="btn btn-primary" id="passwordSubmitBtn" style="align-self:flex-start;">Update Password</button>
+        </form>
+      </div>
+
+      <div class="section-card">
+        <h2>Institution</h2>
+        <div class="info-grid">
+          ${infoItem("College", p.college || CONFIG.collegeName)}
+          ${infoItem("University", p.university || CONFIG.universityName)}
+        </div>
+      </div>
+
+      <div class="button-row"><button class="btn btn-outline" id="profileLogoutBtn" type="button">Logout</button></div>
+    </div>
+  `;
+
+  document.getElementById("avatarInput")?.addEventListener("change", (e) => { const file = e.target.files?.[0]; if (file) uploadAvatar(file); });
+  loadAvatarInto(document.getElementById("avatarImg"), p);
+
+  document.getElementById("nameForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const newName = document.getElementById("nameInput").value.trim();
+    if (!newName) return;
+    try {
+      const sb = getSupabase();
+      const { error } = await sb.from(CONFIG.tables.profiles).update({ name: newName }).eq("id", p.id);
+      if (error) throw error;
+      APP.profile.name = newName;
+      document.getElementById("staffDisplayName").textContent = newName;
+      document.getElementById("staffProfileHeading").textContent = newName;
+      showToast("Name updated.", "success");
+    } catch (err) {
+      showToast(err.message || "Unable to update name.", "error");
+    }
+  });
+
+  document.getElementById("passwordForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const msg = document.getElementById("passwordMessage");
+    const btn = document.getElementById("passwordSubmitBtn");
+    const pw = document.getElementById("newPassword").value;
+    const confirmPw = document.getElementById("confirmPassword").value;
+    msg.style.color = "var(--danger)";
+
+    if (pw !== confirmPw) { msg.textContent = "Passwords don't match."; return; }
+    if (pw.length < 6) { msg.textContent = "Password must be at least 6 characters."; return; }
+
+    btn.disabled = true;
+    msg.textContent = "";
+    try {
+      const sb = getSupabase();
+      // Operates on the CURRENT authenticated session — this is
+      // exactly the "require current authentication" rule: it's only
+      // callable at all because a valid Supabase Auth session already
+      // exists for this user.
+      const { error } = await sb.auth.updateUser({ password: pw });
+      if (error) throw error;
+      msg.style.color = "var(--accent-secondary)";
+      msg.textContent = "Password updated.";
+      document.getElementById("passwordForm").reset();
+    } catch (err) {
+      msg.textContent = err.message || "Unable to update password.";
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById("profileLogoutBtn").addEventListener("click", () => handleLogout());
 }
 
 /* =============================== EXPORTS =============================== */
@@ -1491,6 +2120,30 @@ function syncToggleIcon(toggle) {
 }
 
 /* ================================= UI ================================= */
+
+// Minimal inline-SVG bar chart — no charting library. `pairs` is an
+// array of [label, value]. Colors use style="" (not the fill=
+// attribute) because CSS var() only resolves inside an actual style
+// context, not a raw SVG presentation attribute.
+function renderBarChart(pairs, { width = 560, height = 200, barColor = "var(--accent)" } = {}) {
+  if (!pairs.length) return "";
+  const max = Math.max(...pairs.map((p) => Number(p[1]) || 0), 1);
+  const barWidth = Math.max(24, Math.min(56, (width - 20) / pairs.length - 14));
+  const gap = (width - pairs.length * barWidth) / (pairs.length + 1);
+
+  const bars = pairs.map(([label, value], i) => {
+    const barHeight = Math.round((Number(value) / max) * (height - 46));
+    const x = gap + i * (barWidth + gap);
+    const y = height - 28 - barHeight;
+    return `
+      <rect x="${x}" y="${y}" width="${barWidth}" height="${Math.max(barHeight, 2)}" rx="4" style="fill:${barColor}"></rect>
+      <text x="${x + barWidth / 2}" y="${height - 10}" text-anchor="middle" font-size="11" style="fill:var(--text-muted)">${escapeHtml(label)}</text>
+      <text x="${x + barWidth / 2}" y="${y - 6}" text-anchor="middle" font-size="11" font-weight="700" style="fill:var(--text)">${value}</text>
+    `;
+  }).join("");
+
+  return `<svg viewBox="0 0 ${width} ${height}" style="width:100%; height:auto; max-height:220px; display:block;" role="img" aria-label="Bar chart">${bars}</svg>`;
+}
 
 function showToast(message, type = "info") {
   const stack = document.getElementById("toastStack");

@@ -1,4 +1,5 @@
 /* =========================================================
+   UNIVERSITY PORTAL — style.css
 
    Direction: "Academic Ledger" — editorial serif headings, a
    quiet grotesque body face, warm paper in light mode / deep
@@ -13,6 +14,7 @@
    DASHBOARD/PROFILE · RESULTS · MODAL · TOAST · LOADING
    ANIMATIONS · ACCESSIBILITY · RESPONSIVE · PRINT
    ========================================================= */
+
 /* ---------------- RESET ---------------- */
 *, *::before, *::after { box-sizing: border-box; }
 body, h1, h2, h3, h4, p, figure { margin: 0; }
@@ -269,9 +271,10 @@ footer.app-footer .foot-right { justify-self: end; }
 
 /* ---------------- RESPONSIVE ---------------- */
 @media (max-width: 900px) {
-  #staffTableWrap, #feesContent .ledger { overflow-x: auto; }
+  #staffTableWrap, #feesContent .ledger, #staffMgmtWrap { overflow-x: auto; }
   #staffTableWrap .ledger-head, #staffTableWrap .ledger-row,
-  #feesContent .ledger-head, #feesContent .ledger-row { min-width: 640px; }
+  #feesContent .ledger-head, #feesContent .ledger-row,
+  #staffMgmtWrap .ledger-head, #staffMgmtWrap .ledger-row { min-width: 640px; }
 }
 
 @media (max-width: 860px) {

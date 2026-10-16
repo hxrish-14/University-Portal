@@ -302,7 +302,7 @@ function renderLoginScreen(message) {
           <form id="studentLoginForm" novalidate>
             <div class="field">
               <label for="studentRegno">Register Number</label>
-              <input type="text" id="studentRegno" placeholder="e.g. 1001" autocomplete="username" required>
+              <input type="text" id="studentRegno" placeholder="Eg : 1001" autocomplete="username" required>
             </div>
             <div class="field">
               <label for="studentDob">Date of Birth</label>
@@ -316,7 +316,7 @@ function renderLoginScreen(message) {
           <form id="staffLoginForm" novalidate>
             <div class="field">
               <label for="staffEmail">Staff ID or Admin Email</label>
-              <input type="text" id="staffEmail" placeholder="e.g. Staff or Admin@exampleedu.com" autocomplete="username" required>
+              <input type="text" id="staffEmail" placeholder="Eg : Staff@exampleedu.com" autocomplete="username" required>
             </div>
             <div class="field">
               <label for="staffPassword">Password</label>

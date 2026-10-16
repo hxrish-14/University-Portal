@@ -295,7 +295,7 @@ function renderLoginScreen(message) {
 
         <div class="login-tabs" role="tablist">
           <button type="button" data-tab="student" class="active" role="tab">Student</button>
-          <button type="button" data-tab="staff" role="tab">Staff / Admin</button>
+          <button type="button" data-tab="staff" role="tab">Staff</button>
         </div>
 
         <div class="login-form-panel active" data-panel="student">
@@ -315,7 +315,7 @@ function renderLoginScreen(message) {
         <div class="login-form-panel" data-panel="staff">
           <form id="staffLoginForm" novalidate>
             <div class="field">
-              <label for="staffEmail">Staff ID or Admin Email</label>
+              <label for="staffEmail">Staff Email</label>
               <input type="text" id="staffEmail" placeholder="Eg : Staff@exampleedu.com" autocomplete="username" required>
             </div>
             <div class="field">
